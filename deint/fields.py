@@ -30,6 +30,9 @@ frames, fields, masks, and their rows never alias their inputs or one another.
 
 from __future__ import annotations
 
+import math
+from numbers import Real
+
 __all__ = [
     "DeintError",
     "adaptive_deint",
@@ -45,6 +48,61 @@ __all__ = [
 
 class DeintError(ValueError):
     """Raised for invalid frames, fields, orders, thresholds, or configs."""
+
+
+_ORDERS = ("top", "bottom")
+
+
+def _check_order(order) -> None:
+    if order not in _ORDERS:
+        raise DeintError(f"unsupported field order: {order!r}")
+
+
+def _grid_problems(grid, name):
+    """Return structural problems for a non-empty grid, or an empty list."""
+    problems = []
+    if not isinstance(grid, (list, tuple)):
+        return [f"{name} is not a sequence of rows"]
+    width = None
+    for y, row in enumerate(grid):
+        if not isinstance(row, (list, tuple)):
+            problems.append(f"{name} row {y} is not a sequence")
+            continue
+        if len(row) == 0:
+            problems.append(f"{name} row {y} is empty")
+            continue
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            problems.append(f"{name} row {y} has ragged width {len(row)} (expected {width})")
+        for x, sample in enumerate(row):
+            if not isinstance(sample, Real) or isinstance(sample, bool) or not math.isfinite(sample):
+                problems.append(f"{name} pixel ({y}, {x}) is not a finite number")
+    return problems
+
+
+def _require_valid_frame(frame) -> None:
+    """Raise DeintError unless ``frame`` is a non-empty valid frame."""
+    problems = validate_frame(frame)
+    if problems:
+        raise DeintError("; ".join(problems))
+
+
+def _require_valid_field(field, name) -> None:
+    """Raise DeintError unless ``field`` is a non-empty rectangular finite grid."""
+    problems = _grid_problems(field, name)
+    if problems:
+        raise DeintError("; ".join(problems))
+
+
+def _check_threshold(threshold) -> None:
+    if (
+        not isinstance(threshold, Real)
+        or isinstance(threshold, bool)
+        or not math.isfinite(threshold)
+        or not 0.0 <= threshold <= 1.0
+    ):
+        raise DeintError(f"threshold must be a finite number in [0.0, 1.0], got {threshold!r}")
 
 
 def split_fields(frame, order) -> tuple:
@@ -63,7 +121,15 @@ def split_fields(frame, order) -> tuple:
     result fields are fresh lists and do not mutate or alias the input.
     Numeric results are compared with an absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    _check_order(order)
+    if len(frame) == 0:
+        return ([], [])
+    _require_valid_frame(frame)
+    top = [list(frame[y]) for y in range(0, len(frame), 2)]
+    bottom = [list(frame[y]) for y in range(1, len(frame), 2)]
+    if order == "top":
+        return (top, bottom)
+    return (bottom, top)
 
 
 def weave(top, bottom, order) -> list:
@@ -81,7 +147,23 @@ def weave(top, bottom, order) -> list:
     :class:`DeintError`.  Returned rows are fresh and independent.  Results are
     compared with an absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    _check_order(order)
+    if len(top) == 0 and len(bottom) == 0:
+        return []
+    if len(top) == 0 or len(bottom) == 0:
+        raise DeintError("one field is empty while the other is not")
+    _require_valid_field(top, "top")
+    _require_valid_field(bottom, "bottom")
+    if len(top) != len(bottom) or len(top[0]) != len(bottom[0]):
+        raise DeintError(
+            f"field shapes differ: {len(top)}x{len(top[0])} vs {len(bottom)}x{len(bottom[0])}"
+        )
+    first, second = (top, bottom) if order == "top" else (bottom, top)
+    out = []
+    for i in range(len(first)):
+        out.append(list(first[i]))
+        out.append(list(second[i]))
+    return out
 
 
 def bob(field, order) -> list:
@@ -102,7 +184,31 @@ def bob(field, order) -> list:
     :class:`DeintError`.  Results are compared with an absolute tolerance of
     ``1e-6``.
     """
-    raise NotImplementedError
+    _check_order(order)
+    if len(field) == 0:
+        return []
+    _require_valid_field(field, "field")
+    n = len(field)
+
+    def average(row_a, row_b):
+        return [(a + b) / 2.0 for a, b in zip(row_a, row_b)]
+
+    out = []
+    if order == "top":
+        for i in range(n):
+            out.append(list(field[i]))
+            if i + 1 < n:
+                out.append(average(field[i], field[i + 1]))
+            else:
+                out.append(list(field[i]))
+    else:
+        for i in range(n):
+            if i == 0:
+                out.append(list(field[0]))
+            else:
+                out.append(average(field[i - 1], field[i]))
+            out.append(list(field[i]))
+    return out
 
 
 def blend_fields(top, bottom) -> list:
@@ -119,7 +225,22 @@ def blend_fields(top, bottom) -> list:
     rows are fresh and independent.  Results are compared with an absolute
     tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    if len(top) == 0 and len(bottom) == 0:
+        return []
+    if len(top) == 0 or len(bottom) == 0:
+        raise DeintError("one field is empty while the other is not")
+    _require_valid_field(top, "top")
+    _require_valid_field(bottom, "bottom")
+    if len(top) != len(bottom) or len(top[0]) != len(bottom[0]):
+        raise DeintError(
+            f"field shapes differ: {len(top)}x{len(top[0])} vs {len(bottom)}x{len(bottom[0])}"
+        )
+    out = []
+    for row_top, row_bottom in zip(top, bottom):
+        mean = [(a + b) / 2.0 for a, b in zip(row_top, row_bottom)]
+        out.append(list(mean))
+        out.append(list(mean))
+    return out
 
 
 def motion_detect(top, bottom, threshold) -> list:
@@ -138,7 +259,21 @@ def motion_detect(top, bottom, threshold) -> list:
     ``[0.0, 1.0]`` raises :class:`DeintError`.  Results are compared with an
     absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    _check_threshold(threshold)
+    if len(top) == 0 and len(bottom) == 0:
+        return []
+    if len(top) == 0 or len(bottom) == 0:
+        raise DeintError("one field is empty while the other is not")
+    _require_valid_field(top, "top")
+    _require_valid_field(bottom, "bottom")
+    if len(top) != len(bottom) or len(top[0]) != len(bottom[0]):
+        raise DeintError(
+            f"field shapes differ: {len(top)}x{len(top[0])} vs {len(bottom)}x{len(bottom[0])}"
+        )
+    return [
+        [1.0 if abs(a - b) > threshold else 0.0 for a, b in zip(row_top, row_bottom)]
+        for row_top, row_bottom in zip(top, bottom)
+    ]
 
 
 def adaptive_deint(frame, threshold) -> list:
@@ -160,7 +295,26 @@ def adaptive_deint(frame, threshold) -> list:
     returned frame has the same height and width as the input, with fresh rows.
     Results are compared with an absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    _check_threshold(threshold)
+    if len(frame) == 0:
+        return []
+    _require_valid_frame(frame)
+    top, bottom = split_fields(frame, "top")
+    mask = motion_detect(top, bottom, threshold)
+    n = len(top)
+    out = []
+    for i in range(n):
+        out.append(list(top[i]))
+        if i + 1 < n:
+            interp = [(a + b) / 2.0 for a, b in zip(top[i], top[i + 1])]
+        else:
+            interp = list(top[-1])
+        odd_row = [
+            interp[x] if mask[i][x] == 1.0 else bottom[i][x]
+            for x in range(len(top[i]))
+        ]
+        out.append(odd_row)
+    return out
 
 
 def validate_frame(frame) -> list[str]:
@@ -181,7 +335,15 @@ def validate_frame(frame) -> list[str]:
     :func:`deint_batch` can reject it.  Results are compared with an absolute
     tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    problems = []
+    if not isinstance(frame, (list, tuple)):
+        return ["frame is not a sequence of rows"]
+    if len(frame) == 0:
+        return ["frame is empty"]
+    if len(frame) % 2 != 0:
+        problems.append(f"frame height {len(frame)} is odd")
+    problems.extend(_grid_problems(frame, "frame"))
+    return problems
 
 
 def deint_batch(frames, config) -> dict:
@@ -205,4 +367,18 @@ def deint_batch(frames, config) -> dict:
     result returned and no input mutation.  Results are compared with an
     absolute tolerance of ``1e-6``.
     """
-    raise NotImplementedError
+    if not isinstance(config, dict) or "threshold" not in config:
+        raise DeintError("config must be a mapping containing a 'threshold' key")
+    threshold = config["threshold"]
+    _check_threshold(threshold)
+
+    frames = list(frames)
+    # Validate every frame up front so the batch is all-or-nothing and no
+    # partial output is ever produced.
+    for index, frame in enumerate(frames):
+        problems = validate_frame(frame)
+        if problems:
+            raise DeintError(f"frame {index} is invalid: {'; '.join(problems)}")
+
+    processed = [adaptive_deint(frame, threshold) for frame in frames]
+    return {"frames": processed, "count": len(frames)}
